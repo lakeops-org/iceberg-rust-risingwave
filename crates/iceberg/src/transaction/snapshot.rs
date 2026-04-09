@@ -124,6 +124,7 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
+    pub removed_data_files: Vec<DataFile>,
 
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
@@ -650,6 +651,15 @@ partition_struct: {:?}, partition_type: {:?}",
         };
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
+
+        // Track removed data files
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
 
         for data_file in &self.added_data_files {
             summary_collector.add_file(
