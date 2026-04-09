@@ -299,7 +299,10 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
 
                     for entry in manifest.entries() {
                         if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            manifest_writer.add_entry((**entry).clone())?;
+                            // Preserve the original manifest status and sequence
+                            // metadata when copying entries from an existing
+                            // manifest into a rewritten one.
+                            manifest_writer.add_entry_preserving_status((**entry).clone())?;
                         }
                     }
 

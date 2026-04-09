@@ -123,6 +123,7 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
+    pub removed_data_files: Vec<DataFile>,
 
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
@@ -155,8 +156,8 @@ impl<'a> SnapshotProducer<'a> {
         removed_delete_files: Vec<DataFile>,
     ) -> Self {
         let removed_data_file_paths = removed_data_files
-            .into_iter()
-            .map(|df| df.file_path)
+            .iter()
+            .map(|df| df.file_path.clone())
             .collect();
         let removed_delete_file_paths = removed_delete_files
             .iter()
@@ -179,6 +180,7 @@ impl<'a> SnapshotProducer<'a> {
             added_delete_files,
             removed_data_file_paths,
             removed_delete_file_paths,
+            removed_data_files,
             removed_delete_files,
             new_data_file_sequence_number: None,
             target_branch: MAIN_BRANCH.to_string(),
@@ -643,6 +645,15 @@ partition_struct: {:?}, partition_type: {:?}",
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
+        // Track removed data files
+        for data_file in &self.removed_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
@@ -651,10 +662,11 @@ partition_struct: {:?}, partition_type: {:?}",
             );
         }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // let previous_snapshot = table_metadata
+        //     .snapshot_by_id(self.snapshot_id)
+        //     .and_then(|snapshot| snapshot.parent_snapshot_id())
+        //     .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        let previous_snapshot = table_metadata.snapshot_for_ref(&self.target_branch);
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
