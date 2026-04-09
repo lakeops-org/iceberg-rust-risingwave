@@ -165,12 +165,14 @@ impl SchemaVisitor for GlueSchemaBuilder {
             PrimitiveType::Date => "date".to_string(),
             PrimitiveType::Timestamp => "timestamp".to_string(),
             PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
-                ));
-            }
+            PrimitiveType::Timestamptz => "timestamp".to_string(),
+            PrimitiveType::TimestamptzNs => "timestamp_ns".to_string(),
+            // PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
+            //     return Err(Error::new(
+            //         ErrorKind::FeatureUnsupported,
+            //         format!("Conversion from {p:?} is not supported"),
+            //     ));
+            // }
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
@@ -308,6 +310,18 @@ mod tests {
                     "name": "c13",
                     "required": true,
                     "type": "binary"
+                },
+                {
+                    "id": 14,
+                    "name": "c14",
+                    "required": true,
+                    "type": "timestamptz"
+                },
+                {
+                    "id": 15,
+                    "name": "c15",
+                    "required": true,
+                    "type": "timestamptz_ns"
                 }
             ]
         }"#;
@@ -331,6 +345,8 @@ mod tests {
             create_column("c11", "string", "11", false)?,
             create_column("c12", "binary", "12", false)?,
             create_column("c13", "binary", "13", false)?,
+            create_column("c14", "timestamp", "14", false)?,
+            create_column("c15", "timestamp_ns", "15", false)?,
         ];
 
         assert_eq!(result, expected);
