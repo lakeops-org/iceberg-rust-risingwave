@@ -407,14 +407,14 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     })
                     .collect();
 
-                if !surviving_entries.is_empty() {
-                    // Queue this manifest for rewriting; capture everything needed
-                    // to build the new manifest writer without holding snapshot_produce.
-                    rewrite_tasks.push((idx, manifest_file.partition_spec_id, surviving_entries));
-                }
-                // else: slot stays None — manifest is dropped from the list.
-            }
-        }
+                    for entry in manifest.entries() {
+                        if !found_deleted_files.contains(entry.data_file().file_path()) {
+                            // Preserve the original manifest status and sequence
+                            // metadata when copying entries from an existing
+                            // manifest into a rewritten one.
+                            manifest_writer.add_entry_preserving_status((**entry).clone())?;
+                        }
+                    }
 
         // Phase 2b: fire all rewrites in parallel.
         // Each task creates a new ManifestWriter, writes entries, and flushes to S3.
