@@ -284,7 +284,15 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .collect();
 
             if found_deleted_files.is_empty() {
-                existing_files.push(manifest_file.clone());
+                // Drop manifests that contain only Deleted entries and no live
+                // files — they are tombstone-only manifests left over from prior
+                // snapshots and should not be carried forward (matches Java's
+                // liveEntries() semantics: already-Deleted entries are dropped
+                // from rewritten manifests, so pure-delete manifests become
+                // empty and are not written).
+                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
+                    existing_files.push(manifest_file.clone());
+                }
             } else {
                 // Rewrite the manifest file without the deleted data files
                 if manifest
@@ -298,10 +306,13 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     )?;
 
                     for entry in manifest.entries() {
+                        // Skip entries already marked Deleted in prior snapshots —
+                        // matches Java ManifestFilterManager which iterates
+                        // liveEntries() (status != DELETED) only.
+                        if entry.status() == ManifestStatus::Deleted {
+                            continue;
+                        }
                         if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            // Preserve the original manifest status and sequence
-                            // metadata when copying entries from an existing
-                            // manifest into a rewritten one.
                             manifest_writer.add_entry_preserving_status((**entry).clone())?;
                         }
                     }
@@ -363,5 +374,194 @@ impl TransactionAction for RewriteFilesAction {
 impl Default for RewriteFilesAction {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, ManifestStatus, NestedField,
+        PrimitiveType, Schema, Struct, Type,
+    };
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+
+    fn make_data_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::empty())
+            .build()
+            .unwrap()
+    }
+
+    async fn make_unpartitioned_table(catalog: &impl Catalog) -> crate::table::Table {
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        let ns = NamespaceIdent::new(format!("ns_{}", uuid::Uuid::new_v4()));
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Deleted entries written by a prior snapshot must be dropped — not
+    /// carried forward — when rewrite_files rewrites a manifest.
+    ///
+    /// Scenario:
+    ///   Snapshot 1: append A + B
+    ///   Snapshot 2: overwrite_files deletes B  → manifest contains [B=Deleted]
+    ///   Snapshot 3: rewrite_files replaces A with C
+    ///
+    /// After snap 3, B must not appear in any manifest (Java liveEntries()
+    /// semantics). Before the fix it would be resurrected as Added.
+    #[tokio::test]
+    async fn test_rewrite_drops_prior_deleted_entries() {
+        let catalog = new_memory_catalog().await;
+        let table = make_unpartitioned_table(&catalog).await;
+
+        let file_a = make_data_file("test/a.parquet");
+        let file_b = make_data_file("test/b.parquet");
+        let file_c = make_data_file("test/c.parquet");
+
+        // Snapshot 1: append A + B
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file_a.clone(), file_b.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot 2: delete B — creates a [B=Deleted] manifest entry
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .overwrite_files()
+            .delete_files(vec![file_b.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot 3: rewrite A → C (triggers the bug path)
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .rewrite_files()
+            .add_data_files(vec![file_c.clone()])
+            .delete_files(vec![file_a.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Collect all entries from snapshot 3's manifest list
+        let snap3 = table.metadata().current_snapshot().unwrap();
+        let ml = snap3
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        let mut b_found = false;
+        let mut saw_c_added = false;
+        let mut saw_a_deleted = false;
+
+        for mf in ml.entries() {
+            let m = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in m.entries() {
+                let path = entry.data_file().file_path();
+                if path.ends_with("b.parquet") {
+                    b_found = true;
+                }
+                if path.ends_with("c.parquet") && entry.status() == ManifestStatus::Added {
+                    saw_c_added = true;
+                }
+                if path.ends_with("a.parquet") && entry.status() == ManifestStatus::Deleted {
+                    saw_a_deleted = true;
+                }
+            }
+        }
+
+        assert!(
+            !b_found,
+            "b.parquet was deleted in snapshot 2 and must not appear in snapshot 3's manifests"
+        );
+        assert!(saw_c_added, "c.parquet must appear as Added in snapshot 3");
+        assert!(
+            saw_a_deleted,
+            "a.parquet must appear as Deleted in snapshot 3 (it was replaced)"
+        );
+    }
+
+    /// Carried-forward live entries must be normalised to Existing (not remain
+    /// Added), matching Java ManifestWriter.existing() behaviour.
+    #[tokio::test]
+    async fn test_rewrite_normalizes_carried_entries_to_existing() {
+        let catalog = new_memory_catalog().await;
+        let table = make_unpartitioned_table(&catalog).await;
+
+        let file_a = make_data_file("test/a.parquet");
+        let file_b = make_data_file("test/b.parquet");
+        let file_c = make_data_file("test/c.parquet");
+
+        // Snapshot 1: append A + B
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file_a.clone(), file_b.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot 2: rewrite A → C, keeping B (B carried forward)
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .rewrite_files()
+            .add_data_files(vec![file_c.clone()])
+            .delete_files(vec![file_a.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // B was Added in snap 1; after being carried forward through a manifest
+        // rewrite it must appear as Existing (Java alignment).
+        let snap2 = table.metadata().current_snapshot().unwrap();
+        let ml = snap2
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        let mut b_status: Option<ManifestStatus> = None;
+        for mf in ml.entries() {
+            let m = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in m.entries() {
+                if entry.data_file().file_path().ends_with("b.parquet") {
+                    b_status = Some(entry.status());
+                }
+            }
+        }
+
+        assert_eq!(
+            b_status,
+            Some(ManifestStatus::Existing),
+            "b.parquet was Added in snap 1 but must be Existing after being carried forward"
+        );
     }
 }

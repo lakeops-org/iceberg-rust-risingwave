@@ -279,15 +279,22 @@ impl ManifestWriter {
         Ok(())
     }
 
-    /// Append a manifest entry while *preserving* its status and sequence
-    /// metadata.
+    /// Copy a manifest entry from an existing manifest into the current one,
+    /// preserving all sequence metadata.
     ///
-    /// This is used when copying entries from existing manifests (for example
-    /// when rewriting manifests to drop a subset of files). In those cases we
-    /// must not turn `Deleted`/`Existing` entries into `Added`, nor should we
-    /// overwrite their snapshot/sequence numbers.
+    /// Mirrors the Java reference implementation: live entries (`Added` or
+    /// `Existing`) are normalized to `Existing` (they were introduced in a
+    /// prior snapshot, so they are no longer "new"), while `Deleted` entries
+    /// are carried forward unchanged.  Snapshot id and sequence numbers are
+    /// never overwritten.
     pub(crate) fn add_entry_preserving_status(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
+        match entry.status {
+            ManifestStatus::Added | ManifestStatus::Existing => {
+                entry.status = ManifestStatus::Existing;
+            }
+            ManifestStatus::Deleted => {}
+        }
         self.add_entry_inner(entry)?;
         Ok(())
     }
@@ -738,6 +745,157 @@ mod tests {
         // file sequence number is assigned to None when the entry is added and delete to the manifest.
         entries[0].file_sequence_number = None;
         assert_eq!(actual_manifest, Manifest::new(metadata, entries));
+    }
+
+    fn make_test_writer_ctx() -> (Arc<Schema>, ManifestMetadata, TempDir, crate::io::FileIO) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let metadata = ManifestMetadata {
+            schema_id: 0,
+            schema: schema.clone(),
+            partition_spec: PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .build()
+                .unwrap(),
+            content: ManifestContentType::Data,
+            format_version: FormatVersion::V2,
+        };
+        let tmp = TempDir::new().unwrap();
+        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        (schema, metadata, tmp, io)
+    }
+
+    fn make_test_entry(status: ManifestStatus, path: &str) -> ManifestEntry {
+        ManifestEntry {
+            status,
+            snapshot_id: Some(1),
+            sequence_number: Some(2),
+            file_sequence_number: Some(3),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: path.to_string(),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::empty(),
+                record_count: 10,
+                file_size_in_bytes: 1024,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }
+    }
+
+    /// Added entries from a prior snapshot must be normalized to Existing when
+    /// carried forward — matching the Java ManifestWriter.existing() behaviour.
+    #[tokio::test]
+    async fn test_preserving_status_added_normalizes_to_existing() {
+        let (_, metadata, tmp, io) = make_test_writer_ctx();
+        let path = tmp.path().join("manifest.avro");
+        let output = io.new_output(path.to_str().unwrap()).unwrap();
+
+        let entry = make_test_entry(ManifestStatus::Added, "s3://bucket/added.parquet");
+        let writer_snapshot_id = Some(99); // writer uses a different snapshot id
+
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            writer_snapshot_id,
+            None,
+            metadata.schema.clone(),
+            metadata.partition_spec.clone(),
+        )
+        .build_v2_data();
+        writer.add_entry_preserving_status(entry.clone()).unwrap();
+        writer.write_manifest_file().await.unwrap();
+
+        let manifest =
+            Manifest::parse_avro(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        let out = &manifest.entries()[0];
+
+        assert_eq!(out.status(), ManifestStatus::Existing, "Added must be normalized to Existing");
+        assert_eq!(out.snapshot_id(), entry.snapshot_id(), "snapshot_id must be preserved, not overwritten with writer's");
+        assert_eq!(out.sequence_number(), entry.sequence_number(), "sequence_number must be preserved");
+        assert_eq!(out.file_sequence_number(), entry.file_sequence_number(), "file_sequence_number must be preserved");
+    }
+
+    /// Existing entries carried forward must stay Existing with all metadata intact.
+    #[tokio::test]
+    async fn test_preserving_status_existing_stays_existing() {
+        let (_, metadata, tmp, io) = make_test_writer_ctx();
+        let path = tmp.path().join("manifest.avro");
+        let output = io.new_output(path.to_str().unwrap()).unwrap();
+
+        let entry = make_test_entry(ManifestStatus::Existing, "s3://bucket/existing.parquet");
+
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(99),
+            None,
+            metadata.schema.clone(),
+            metadata.partition_spec.clone(),
+        )
+        .build_v2_data();
+        writer.add_entry_preserving_status(entry.clone()).unwrap();
+        writer.write_manifest_file().await.unwrap();
+
+        let manifest =
+            Manifest::parse_avro(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        let out = &manifest.entries()[0];
+
+        assert_eq!(out.status(), ManifestStatus::Existing);
+        assert_eq!(out.snapshot_id(), entry.snapshot_id());
+        assert_eq!(out.sequence_number(), entry.sequence_number());
+        assert_eq!(out.file_sequence_number(), entry.file_sequence_number());
+    }
+
+    /// Deleted entries must not be resurrected as Added when carried forward
+    /// (regression test for https://github.com/risingwavelabs/iceberg-rust/issues/135).
+    #[tokio::test]
+    async fn test_preserving_status_deleted_stays_deleted() {
+        let (_, metadata, tmp, io) = make_test_writer_ctx();
+        let path = tmp.path().join("manifest.avro");
+        let output = io.new_output(path.to_str().unwrap()).unwrap();
+
+        let entry = make_test_entry(ManifestStatus::Deleted, "s3://bucket/deleted.parquet");
+
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(99),
+            None,
+            metadata.schema.clone(),
+            metadata.partition_spec.clone(),
+        )
+        .build_v2_data();
+        writer.add_entry_preserving_status(entry.clone()).unwrap();
+        writer.write_manifest_file().await.unwrap();
+
+        let manifest =
+            Manifest::parse_avro(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        let out = &manifest.entries()[0];
+
+        assert_eq!(out.status(), ManifestStatus::Deleted, "Deleted must not be resurrected as Added");
+        assert_eq!(out.snapshot_id(), entry.snapshot_id());
+        assert_eq!(out.sequence_number(), entry.sequence_number());
+        assert_eq!(out.file_sequence_number(), entry.file_sequence_number());
     }
 
     #[tokio::test]
