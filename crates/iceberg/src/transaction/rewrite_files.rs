@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, MergeManifestProcess, SnapshotProducer};
@@ -241,6 +242,96 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         }
     }
 
+    // Original sequential implementation — kept for reference.
+    // Replaced by existing_manifest below which loads manifests concurrently.
+    //
+    // async fn existing_manifest_sequential(
+    //     &self,
+    //     snapshot_produce: &mut SnapshotProducer<'_>,
+    // ) -> Result<Vec<ManifestFile>> {
+    //     let table_metadata_ref = snapshot_produce.table.metadata();
+    //     let file_io_ref = snapshot_produce.table.file_io();
+    //
+    //     let Some(snapshot) = snapshot_produce
+    //         .table
+    //         .metadata()
+    //         .snapshot_for_ref(snapshot_produce.target_branch())
+    //     else {
+    //         return Ok(vec![]);
+    //     };
+    //
+    //     let manifest_list = snapshot
+    //         .load_manifest_list(file_io_ref, table_metadata_ref)
+    //         .await?;
+    //
+    //     let mut existing_files = Vec::new();
+    //
+    //     for manifest_file in manifest_list.entries() {
+    //         let manifest = manifest_file.load_manifest(file_io_ref).await?;
+    //
+    //         let found_deleted_files: HashSet<_> = manifest
+    //             .entries()
+    //             .iter()
+    //             .filter_map(|entry| {
+    //                 if snapshot_produce
+    //                     .removed_data_file_paths
+    //                     .contains(entry.data_file().file_path())
+    //                     || snapshot_produce
+    //                         .removed_delete_file_paths
+    //                         .contains(entry.data_file().file_path())
+    //                 {
+    //                     Some(entry.data_file().file_path().to_string())
+    //                 } else {
+    //                     None
+    //                 }
+    //             })
+    //             .collect();
+    //
+    //         if found_deleted_files.is_empty() {
+    //             existing_files.push(manifest_file.clone());
+    //         } else {
+    //             // Rewrite the manifest file without the deleted data files
+    //             if manifest
+    //                 .entries()
+    //                 .iter()
+    //                 .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
+    //             {
+    //                 let mut manifest_writer = snapshot_produce.new_manifest_writer(
+    //                     ManifestContentType::Data,
+    //                     manifest_file.partition_spec_id,
+    //                 )?;
+    //
+    //                 for entry in manifest.entries() {
+    //                     if !found_deleted_files.contains(entry.data_file().file_path()) {
+    //                         manifest_writer.add_entry_preserving_status((**entry).clone())?;
+    //                     }
+    //                 }
+    //
+    //                 existing_files.push(manifest_writer.write_manifest_file().await?);
+    //             }
+    //         }
+    //     }
+    //
+    //     Ok(existing_files)
+    // }
+
+    /// Loads all existing manifests concurrently, rewrites those that contain deleted entries,
+    /// and returns the resulting manifest list in original order.
+    ///
+    /// # Concurrency strategy
+    ///
+    /// **Phase 1 — concurrent loads with order preservation:**
+    /// Uses `futures::stream::buffered` (not `buffer_unordered`) so manifests are yielded in the
+    /// same order as the manifest list. Order matters for Iceberg V3 tables where `ManifestListWriter`
+    /// assigns `first_row_id` sequentially as it processes the manifest list. Reordering would
+    /// corrupt row lineage tracking. For V1/V2 tables order has no correctness impact, but
+    /// `buffered` is used uniformly to be safe across all format versions.
+    ///
+    /// **Phase 2 — parallel rewrites:**
+    /// Manifests that contain entries for deleted files must be rewritten (new Avro file without
+    /// those entries). Each rewrite produces an independent new S3 file, so all rewrites fire in
+    /// parallel via `futures::future::try_join_all`. Results are indexed back to their original
+    /// manifest list position so the final `existing_files` vec preserves input order.
     async fn existing_manifest(
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
@@ -260,23 +351,41 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             .load_manifest_list(file_io_ref, table_metadata_ref)
             .await?;
 
-        let mut existing_files = Vec::new();
+        // Phase 1: load all manifests concurrently, preserving original order.
+        // `buffered` (ordered) rather than `buffer_unordered` keeps the manifest list
+        // order intact — required for correct first_row_id assignment in V3 tables.
+        const LOAD_CONCURRENCY: usize = 32;
+        let loaded: Vec<_> = futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let file_io = file_io_ref.clone();
+                async move {
+                    let manifest = mf.load_manifest(&file_io).await?;
+                    Ok::<_, crate::Error>((mf, manifest))
+                }
+            })
+            .buffered(LOAD_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
 
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io_ref).await?;
+        // Phase 2: classify each manifest as keep-as-is or needs-rewrite.
+        // Rewrites are collected with their original index so we can reassemble
+        // the output in the correct order after firing them in parallel.
+        let removed_data = &snapshot_produce.removed_data_file_paths;
+        let removed_deletes = &snapshot_produce.removed_delete_file_paths;
 
-            let found_deleted_files: HashSet<_> = manifest
+        let mut existing_files: Vec<Option<ManifestFile>> = vec![None; loaded.len()];
+        let mut rewrite_tasks = Vec::new();
+
+        for (idx, (manifest_file, manifest)) in loaded.into_iter().enumerate() {
+            let found_deleted_files: HashSet<String> = manifest
                 .entries()
                 .iter()
                 .filter_map(|entry| {
-                    if snapshot_produce
-                        .removed_data_file_paths
-                        .contains(entry.data_file().file_path())
-                        || snapshot_produce
-                            .removed_delete_file_paths
-                            .contains(entry.data_file().file_path())
-                    {
-                        Some(entry.data_file().file_path().to_string())
+                    let path = entry.data_file().file_path();
+                    if removed_data.contains(path) || removed_deletes.contains(path) {
+                        Some(path.to_string())
                     } else {
                         None
                     }
@@ -284,34 +393,58 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .collect();
 
             if found_deleted_files.is_empty() {
-                existing_files.push(manifest_file.clone());
+                // No deleted entries — keep the manifest file unchanged.
+                existing_files[idx] = Some(manifest_file);
             } else {
-                // Rewrite the manifest file without the deleted data files
-                if manifest
-                    .entries()
-                    .iter()
-                    .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
-                {
-                    let mut manifest_writer = snapshot_produce.new_manifest_writer(
-                        ManifestContentType::Data,
-                        manifest_file.partition_spec_id,
-                    )?;
+                // Check whether any entries survive after removing deleted files.
+                // If all entries are deleted the manifest is dropped entirely (None stays).
+                let surviving_entries: Vec<_> = manifest
+                    .into_parts()
+                    .0
+                    .into_iter()
+                    .filter(|entry| {
+                        !found_deleted_files.contains(entry.data_file().file_path())
+                    })
+                    .collect();
 
-                    for entry in manifest.entries() {
-                        if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            // Preserve the original manifest status and sequence
-                            // metadata when copying entries from an existing
-                            // manifest into a rewritten one.
-                            manifest_writer.add_entry_preserving_status((**entry).clone())?;
-                        }
-                    }
-
-                    existing_files.push(manifest_writer.write_manifest_file().await?);
+                if !surviving_entries.is_empty() {
+                    // Queue this manifest for rewriting; capture everything needed
+                    // to build the new manifest writer without holding snapshot_produce.
+                    rewrite_tasks.push((idx, manifest_file.partition_spec_id, surviving_entries));
                 }
+                // else: slot stays None — manifest is dropped from the list.
             }
         }
 
-        Ok(existing_files)
+        // Phase 2b: fire all rewrites in parallel.
+        // Each task creates a new ManifestWriter, writes entries, and flushes to S3.
+        // The writers are independent (different output paths, shared only by the
+        // atomic manifest_counter inside snapshot_produce which is safe for concurrent use).
+        let rewrite_futures: Vec<_> = rewrite_tasks
+            .into_iter()
+            .map(|(idx, partition_spec_id, entries)| {
+                let mut writer = snapshot_produce
+                    .new_manifest_writer(ManifestContentType::Data, partition_spec_id);
+                async move {
+                    let mut mw = writer?;
+                    for entry in entries {
+                        mw.add_entry_preserving_status((*entry).clone())?;
+                    }
+                    let written = mw.write_manifest_file().await?;
+                    Ok::<_, crate::Error>((idx, written))
+                }
+            })
+            .collect();
+
+        let rewritten = futures::future::try_join_all(rewrite_futures).await?;
+
+        // Slot rewritten manifests back at their original indices.
+        for (idx, manifest_file) in rewritten {
+            existing_files[idx] = Some(manifest_file);
+        }
+
+        // Flatten, dropping None slots (fully-deleted manifests).
+        Ok(existing_files.into_iter().flatten().collect())
     }
 }
 

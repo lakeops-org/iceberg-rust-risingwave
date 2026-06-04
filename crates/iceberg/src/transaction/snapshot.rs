@@ -123,7 +123,6 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
-    pub removed_data_files: Vec<DataFile>,
 
     // for filtering out files that are removed by action
     pub removed_data_file_paths: HashSet<String>,
@@ -302,7 +301,7 @@ impl<'a> SnapshotProducer<'a> {
                         ErrorKind::DataInvalid,
                         "Invalid partition spec id for new manifest writer",
                     )
-                    .with_context("partition spec id", partition_spec_id.to_string())
+                        .with_context("partition spec id", partition_spec_id.to_string())
                 })?
                 .as_ref()
                 .clone(),
@@ -556,7 +555,7 @@ partition_struct: {:?}, partition_type: {:?}",
                             ErrorKind::DataInvalid,
                             "Invalid schema id for existing manifest filtering",
                         )
-                        .with_context("schema id", schema_id.to_string())
+                            .with_context("schema id", schema_id.to_string())
                     })?
                     .as_ref()
                     .clone();
@@ -650,15 +649,6 @@ partition_struct: {:?}, partition_type: {:?}",
         };
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
-
-        // Track removed data files
-        for data_file in &self.removed_data_files {
-            summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
-            );
-        }
 
         for data_file in &self.added_data_files {
             summary_collector.add_file(
@@ -958,7 +948,7 @@ partition_struct: {:?}, partition_type: {:?}",
                 manifest_files,
                 crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
             )
-            .await?;
+                .await?;
 
             'outer: for (_, manifest) in &loaded_manifests {
                 for entry in manifest.entries() {
@@ -1099,21 +1089,21 @@ impl MergeManifestManager {
             manifest_bin,
             crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
         )
-        .await?;
+            .await?;
 
         for (_, manifest) in loaded {
             for manifest_entry in manifest.entries() {
                 if manifest_entry.status() == ManifestStatus::Deleted
                     && manifest_entry
-                        .snapshot_id()
-                        .is_some_and(|id| id == snapshot_id)
+                    .snapshot_id()
+                    .is_some_and(|id| id == snapshot_id)
                 {
                     //only files deleted by this snapshot should be added to the new manifest
                     writer.add_delete_entry(manifest_entry.as_ref().clone())?;
                 } else if manifest_entry.status() == ManifestStatus::Added
                     && manifest_entry
-                        .snapshot_id()
-                        .is_some_and(|id| id == snapshot_id)
+                    .snapshot_id()
+                    .is_some_and(|id| id == snapshot_id)
                 {
                     //added entries from this snapshot are still added, otherwise they should be existing
                     writer.add_entry(manifest_entry.as_ref().clone())?;
@@ -1143,8 +1133,8 @@ impl MergeManifestManager {
                 if manifest_bin.len() == 1 {
                     Ok(Box::pin(async { Ok(manifest_bin) })
                         as Pin<
-                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
-                        >)
+                        Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                    >)
                 }
                 //  if the bin has the first manifest (the new data files or an appended manifest file) then only
                 //  merge it if the number of manifests is above the minimum count. this is applied only to bins
@@ -1156,8 +1146,8 @@ impl MergeManifestManager {
                 {
                     Ok(Box::pin(async { Ok(manifest_bin) })
                         as Pin<
-                            Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
-                        >)
+                        Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
+                    >)
                 } else {
                     let writer = snapshot_produce.new_manifest_writer(self.content, snapshot_produce.table.metadata().default_partition_spec_id())?;
                     let snapshot_id = snapshot_produce.snapshot_id;
@@ -1170,7 +1160,7 @@ impl MergeManifestManager {
                                 manifest_bin,
                                 writer,
                             )
-                            .await?,
+                                .await?,
                         ])
                     }))
                         as Pin<Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>>)
