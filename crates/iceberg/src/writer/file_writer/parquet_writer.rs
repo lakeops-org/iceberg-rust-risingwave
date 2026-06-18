@@ -113,7 +113,6 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             accumulated_compressed: 0,
             accumulated_uncompressed_proxy: 0,
             last_bytes_written: 0,
-            last_in_progress_size: 0,
         })
     }
 }
@@ -246,14 +245,15 @@ pub struct ParquetWriter {
     nan_value_count_visitor: NanValueCountVisitor,
     // Compression ratio tracking for `current_written_size`.
     //
-    // When a row-group flush is detected (bytes_written increases after a write),
-    // we accumulate the compressed delta and the pre-write in_progress size as a
-    // proxy for the uncompressed bytes flushed. Both terms come from the same
-    // writer API so they stay in consistent units — no allocator metrics mixed in.
+    // On each write we sample in_progress_size() before and bytes_written() after.
+    // When bytes_written increases a row-group flush occurred: the pre-write
+    // in_progress value is a proxy for the uncompressed bytes that were flushed,
+    // and the delta in bytes_written is the compressed output. Accumulating both
+    // lets current_written_size() extrapolate the buffered bytes using the
+    // observed ratio rather than returning raw (compressed) flushed bytes only.
     accumulated_compressed: usize,
     accumulated_uncompressed_proxy: usize,
     last_bytes_written: usize,
-    last_in_progress_size: usize,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -556,7 +556,9 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
-        let pre_in_progress = self.last_in_progress_size;
+        // Sample in_progress BEFORE the write so we capture what was buffered
+        // at the moment the flush fires — not the stale value from the previous call.
+        let pre_in_progress = writer.in_progress_size();
 
         writer.write(batch).await.map_err(|err| {
             Error::new(
@@ -567,17 +569,14 @@ impl FileWriter for ParquetWriter {
         })?;
 
         let post_bytes = writer.bytes_written();
-        let post_in_progress = writer.in_progress_size();
 
-        // Detect row-group flushes: bytes_written only grows when a row group is committed.
-        // Use the pre-write in_progress as a proxy for the uncompressed bytes that were
-        // flushed. Both metrics come from the same writer API so units are consistent.
+        // bytes_written only grows when a row-group is committed to the output.
+        // pre_in_progress is the uncompressed proxy for what was flushed.
         if post_bytes > self.last_bytes_written && pre_in_progress > 0 {
             self.accumulated_compressed += post_bytes - self.last_bytes_written;
             self.accumulated_uncompressed_proxy += pre_in_progress;
         }
         self.last_bytes_written = post_bytes;
-        self.last_in_progress_size = post_in_progress;
 
         Ok(())
     }
