@@ -43,6 +43,7 @@ pub(crate) fn available_parallelism() -> NonZeroUsize {
     })
 }
 
+/// Bin-packing utilities for manifest merging.
 pub mod bin {
     use std::iter::Iterator;
     use std::marker::PhantomData;
@@ -188,6 +189,7 @@ pub mod bin {
     }
 }
 
+/// Iterator over ancestor snapshots in a snapshot chain.
 pub struct Ancestors {
     next: Option<SnapshotRef>,
     get_snapshot: Box<dyn Fn(i64) -> Option<SnapshotRef> + Send>,
@@ -281,7 +283,7 @@ pub(crate) async fn load_manifest_lists(
 }
 
 /// Concurrently loads manifests for the given manifest files.
-pub(crate) async fn load_manifests(
+pub async fn load_manifests(
     file_io: &FileIO,
     manifest_files: Vec<ManifestFile>,
     concurrency: usize,

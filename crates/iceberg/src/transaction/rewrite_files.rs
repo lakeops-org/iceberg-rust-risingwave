@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, MergeManifestProcess, SnapshotProducer};
@@ -28,8 +29,8 @@ use super::{
 };
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation,
+    DataContentType, DataFile, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, Operation,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -241,6 +242,13 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         }
     }
 
+    /// Loads all existing manifests concurrently (preserving manifest-list order for V3
+    /// `first_row_id` correctness), then rewrites any that contain deleted entries.
+    ///
+    /// The speedup vs the sequential original comes entirely from Phase 1: all manifest
+    /// Avro files are fetched in parallel via `buffered` (ordered, not `buffer_unordered`)
+    /// so the manifest-list order is intact when Phase 2 runs. Phase 2 is sequential and
+    /// identical in logic to the original implementation.
     async fn existing_manifest(
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
@@ -260,11 +268,27 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             .load_manifest_list(file_io_ref, table_metadata_ref)
             .await?;
 
-        let mut existing_files = Vec::new();
+        // Phase 1: load all manifests concurrently, preserving original order.
+        // `buffered` (ordered) rather than `buffer_unordered` keeps the manifest list
+        // order intact — required for correct first_row_id assignment in V3 tables.
+        const LOAD_CONCURRENCY: usize = 16;
+        let loaded: Vec<(ManifestFile, Manifest)> =
+            futures::stream::iter(manifest_list.entries().iter().cloned())
+                .map(|mf| {
+                    let file_io = file_io_ref.clone();
+                    async move {
+                        let manifest = mf.load_manifest(&file_io).await?;
+                        Ok::<_, crate::Error>((mf, manifest))
+                    }
+                })
+                .buffered(LOAD_CONCURRENCY)
+                .try_collect()
+                .await?;
 
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io_ref).await?;
+        // Phase 2: sequential processing — identical logic to the original implementation.
+        let mut existing_files = Vec::with_capacity(loaded.len());
 
+        for (manifest_file, manifest) in loaded {
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
@@ -284,30 +308,24 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 .collect();
 
             if found_deleted_files.is_empty() {
-                existing_files.push(manifest_file.clone());
-            } else {
-                // Rewrite the manifest file without the deleted data files
-                if manifest
-                    .entries()
-                    .iter()
-                    .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
-                {
-                    let mut manifest_writer = snapshot_produce.new_manifest_writer(
-                        ManifestContentType::Data,
-                        manifest_file.partition_spec_id,
-                    )?;
+                existing_files.push(manifest_file);
+            } else if manifest
+                .entries()
+                .iter()
+                .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
+            {
+                let mut manifest_writer = snapshot_produce.new_manifest_writer(
+                    ManifestContentType::Data,
+                    manifest_file.partition_spec_id,
+                )?;
 
-                    for entry in manifest.entries() {
-                        if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            // Preserve the original manifest status and sequence
-                            // metadata when copying entries from an existing
-                            // manifest into a rewritten one.
-                            manifest_writer.add_entry_preserving_status((**entry).clone())?;
-                        }
+                for entry in manifest.entries() {
+                    if !found_deleted_files.contains(entry.data_file().file_path()) {
+                        manifest_writer.add_entry_preserving_status((**entry).clone())?;
                     }
-
-                    existing_files.push(manifest_writer.write_manifest_file().await?);
                 }
+
+                existing_files.push(manifest_writer.write_manifest_file().await?);
             }
         }
 
