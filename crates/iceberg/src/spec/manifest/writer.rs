@@ -330,18 +330,6 @@ impl ManifestWriter {
         Ok(())
     }
 
-    /// Append a manifest entry while *preserving* its status and sequence
-    /// metadata.
-    ///
-    /// This is used when copying entries from existing manifests (for example
-    /// when rewriting manifests to drop a subset of files). In those cases we
-    /// must not turn `Deleted`/`Existing` entries into `Added`, nor should we
-    /// overwrite their snapshot/sequence numbers.
-    pub(crate) fn add_entry_preserving_status(&mut self, mut entry: ManifestEntry) -> Result<()> {
-        self.check_data_file(&entry.data_file)?;
-        self.add_entry_inner(entry)?;
-        Ok(())
-    }
 
     /// Add file as an added entry with a specific sequence number. The entry's snapshot ID will be this manifest's snapshot ID. The entry's data sequence
     /// number will be the provided data sequence number. The entry's file sequence number will be
