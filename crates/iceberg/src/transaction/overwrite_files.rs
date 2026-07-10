@@ -302,6 +302,7 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
                         // their file sequence number.
                         if survives(entry) {
                             manifest_writer.add_existing_entry((**entry).clone())?;
+
                         }
                     }
 
