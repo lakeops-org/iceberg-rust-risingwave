@@ -94,7 +94,8 @@ pub mod actions;
 pub mod arrow;
 pub(crate) mod delete_file_index;
 pub mod test_utils;
-mod utils;
+/// Internal utilities for concurrent manifest loading and snapshot traversal.
+pub mod utils;
 pub mod writer;
 
 pub mod delete_vector;
