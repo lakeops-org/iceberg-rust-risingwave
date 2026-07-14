@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -866,6 +867,17 @@ partition_struct: {:?}, partition_type: {:?}",
         &self.target_branch
     }
 
+    /// Get the ID assigned to the snapshot this producer will emit.
+    ///
+    /// This is the ID of the *new* snapshot being proposed, not of any
+    /// existing snapshot in the table. Actions that store retry state
+    /// (e.g. `RewriteManifestsAction`) capture this so subsequent attempts
+    /// can reuse the same identity — critical when cached manifest files
+    /// stamped with `added_snapshot_id = this ID` are carried forward.
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
     /// Enable delete filter manager for this snapshot (lazy initialization)
     /// This will also populate the manager with files already marked for removal
     pub fn enable_delete_filter_manager(&mut self) {
@@ -950,21 +962,29 @@ partition_struct: {:?}, partition_type: {:?}",
 
         let mut duplicate_files = Vec::new();
 
-        // Load all manifests concurrently, then scan entries
+        // Scan the current snapshot's manifests to detect duplicate adds and
+        // validate deletes.
         if let Some(current_snapshot) = branch_snapshot_ref {
             let manifest_list = current_snapshot
                 .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
                 .await?;
 
             let manifest_files: Vec<_> = manifest_list.entries().to_vec();
-            let loaded_manifests = load_manifests(
-                table.file_io(),
-                manifest_files,
-                crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT,
-            )
-            .await?;
+            // Stream the current snapshot's manifests instead of loading them all
+            // up front: each manifest is dropped immediately after it is scanned,
+            // and the early-exit below stops pulling further manifests once both
+            // validation checks are satisfied. This bounds peak memory and avoids
+            // loading the whole manifest set for large snapshots.
+            let file_io = table.file_io().clone();
+            let mut manifest_stream = futures::stream::iter(manifest_files)
+                .map(|manifest_file| {
+                    let file_io = file_io.clone();
+                    async move { manifest_file.load_manifest(&file_io).await }
+                })
+                .buffer_unordered(crate::utils::DEFAULT_LOAD_CONCURRENCY_LIMIT);
 
-            'outer: for (_, manifest) in &loaded_manifests {
+            'outer: while let Some(manifest) = manifest_stream.next().await {
+                let manifest = manifest?;
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;
@@ -1238,7 +1258,7 @@ mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Operation,
         Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
     };
-    use crate::transaction::rewrite_files::RewriteFilesOperation;
+    use crate::transaction::replace_files::{Overwrite, ReplaceFilesOperation, Rewrite};
     use crate::transaction::tests::make_v2_minimal_table;
 
     const TOTAL_DATA_FILES_KEY: &str = "total-data-files";
@@ -1350,7 +1370,9 @@ mod tests {
             vec![],
         );
 
-        let summary = producer.summary(&RewriteFilesOperation).unwrap();
+        let summary = producer
+            .summary(&ReplaceFilesOperation::<Rewrite>::new())
+            .unwrap();
         assert_eq!(summary.operation, Operation::Replace);
         let props = &summary.additional_properties;
 
@@ -1480,7 +1502,9 @@ mod tests {
             vec![],
         );
 
-        let summary = producer.summary(&RewriteFilesOperation).unwrap();
+        let summary = producer
+            .summary(&ReplaceFilesOperation::<Rewrite>::new())
+            .unwrap();
         let props = &summary.additional_properties;
 
         // Added delete-file accounting — absent before the fix.
@@ -1551,8 +1575,6 @@ mod tests {
     /// the accounting as it always has.
     #[tokio::test]
     async fn test_overwrite_summary_does_not_underflow_after_prior_truncate() {
-        use crate::transaction::overwrite_files::OverwriteFilesOperation;
-
         // Build a parent whose `total-*` are all zero — i.e. the prior
         // commit was a full-table overwrite that already drained the totals.
         // This is the precondition for the underflow on the next overwrite
@@ -1628,7 +1650,9 @@ mod tests {
         // allowed to report zeros across the board — that matches what the
         // JVM Iceberg reference produces for a no-op overwrite on an empty
         // (post-truncate) table.
-        let summary = producer.summary(&OverwriteFilesOperation).unwrap();
+        let summary = producer
+            .summary(&ReplaceFilesOperation::<Overwrite>::new())
+            .unwrap();
         assert_eq!(summary.operation, Operation::Overwrite);
         let props = &summary.additional_properties;
         assert_eq!(props.get(TOTAL_RECORDS_KEY).map(String::as_str), Some("0"));
