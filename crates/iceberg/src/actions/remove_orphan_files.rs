@@ -130,11 +130,16 @@ impl RemoveOrphanFilesAction {
         let file_stream = file_io.list(&location, true).await?;
         let older_than_ms = self.older_than_ms;
 
+        // Find orphan files: not reachable, not a directory, and older than threshold
         let orphan_files: Vec<OrphanFile> = file_stream
             .try_filter_map(|entry| {
                 let is_orphan =
+                    // Must be a file (not directory)
                     !entry.metadata.is_dir
+                    // Must not be reachable
                     && !reachable_files.contains(&entry.path)
+                    // Must have a timestamp and be older than threshold
+                    // (files without timestamp are skipped to protect in-progress writes)
                     && entry.metadata.last_modified_ms.is_some_and(|ts| ts < older_than_ms);
 
                 async move {
@@ -151,6 +156,10 @@ impl RemoveOrphanFilesAction {
             return Ok(orphan_files);
         }
 
+        // Remove orphan files concurrently.
+        // Clone paths into owned Strings so each async task owns its data,
+        // making the resulting future Send-safe (avoids HRTB lifetime issues
+        // with borrowed references across await points).
         let file_io = file_io.clone();
         stream::iter(orphan_files.iter().map(|f| f.path.clone()))
             .map(|path| {
