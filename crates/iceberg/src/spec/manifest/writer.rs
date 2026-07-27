@@ -223,9 +223,11 @@ fn datum_serialized_len(datum: &Datum) -> u64 {
 
             let min_len = (16 - start) as u64;
             let max_len = match datum.data_type() {
-                PrimitiveType::Decimal { precision, .. } => crate::spec::Type::decimal_required_bytes(*precision)
-                    .map(|n| n as u64)
-                    .unwrap_or(16),
+                PrimitiveType::Decimal { precision, .. } => {
+                    crate::spec::Type::decimal_required_bytes(*precision)
+                        .map(|n| n as u64)
+                        .unwrap_or(16)
+                }
                 _ => 16,
             };
             min_len.min(max_len)
@@ -385,6 +387,9 @@ impl ManifestWriter {
     /// - Set the file sequence number to `None`
     pub(crate) fn add_entry(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
+        // This helper is intended for *new* entries in the current snapshot. It
+        // always marks the entry as Added and associates it with this writer's
+        // snapshot, discarding any existing sequence metadata.
         if entry.sequence_number().is_some_and(|n| n >= 0) {
             entry.status = ManifestStatus::Added;
             entry.snapshot_id = self.snapshot_id;
@@ -482,9 +487,21 @@ impl ManifestWriter {
     }
 
     fn add_entry_inner(&mut self, entry: ManifestEntry) -> Result<()> {
+        // Validate that EXISTING/DELETED entries have required sequence numbers.
+        // However, we allow EXISTING/DELETED entries to have null file_sequence_number when
+        // sequence_number is set, as some older writers produced such manifests.
+        // Per Java's ManifestEntry: "This may happen while reading a v2 manifest that
+        // did not persist the file sequence number for manifest entries with status
+        // EXISTING or DELETED (older Iceberg versions)."
+        let has_seq_num_but_no_file_seq_num = (entry.status == ManifestStatus::Existing
+            || entry.status == ManifestStatus::Deleted)
+            && entry.sequence_number.is_some()
+            && entry.file_sequence_number.is_none();
+
         // Check if the entry has sequence number
         if (entry.status == ManifestStatus::Deleted || entry.status == ManifestStatus::Existing)
             && (entry.sequence_number.is_none() || entry.file_sequence_number.is_none())
+            && !has_seq_num_but_no_file_seq_num
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,

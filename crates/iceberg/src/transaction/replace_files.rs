@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use super::snapshot::{DefaultManifestProcess, MergeManifestProcess, SnapshotProducer};
