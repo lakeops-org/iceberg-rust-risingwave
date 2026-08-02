@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -61,11 +61,21 @@ impl ReplaceFilesMode for Overwrite {
 /// collide with `impl SnapshotProduceOperation for FastAppendOperation`: the
 /// compiler cannot prove `FastAppendOperation` will never implement
 /// `ReplaceFilesMode`. This wrapper carries the shared implementation instead.
-pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode>(PhantomData<M>);
+pub(crate) struct ReplaceFilesOperation<M: ReplaceFilesMode> {
+    _mode: PhantomData<M>,
+    // Populated by `existing_manifest` (which always runs first — see the call
+    // order in `SnapshotProducer::commit`) as a side effect of its single pass
+    // over the manifest list, so `delete_entries` can drain it instead of
+    // re-scanning every manifest a second time.
+    deleted_entries: Mutex<Option<Vec<ManifestEntry>>>,
+}
 
 impl<M: ReplaceFilesMode> ReplaceFilesOperation<M> {
     pub(crate) fn new() -> Self {
-        Self(PhantomData)
+        Self {
+            _mode: PhantomData,
+            deleted_entries: Mutex::new(None),
+        }
     }
 }
 
@@ -76,64 +86,21 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
     async fn delete_entries(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        _snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestEntry>> {
-        // generate delete manifest entries from removed files
-        let snapshot = snapshot_produce
-            .table
-            .metadata()
-            .snapshot_for_ref(snapshot_produce.target_branch());
-
-        if let Some(snapshot) = snapshot {
-            let gen_manifest_entry = |old_entry: &Arc<ManifestEntry>| {
-                let builder = ManifestEntry::builder()
-                    .status(ManifestStatus::Deleted)
-                    .snapshot_id(old_entry.snapshot_id().unwrap())
-                    .sequence_number(old_entry.sequence_number().unwrap())
-                    .file_sequence_number(old_entry.file_sequence_number().unwrap())
-                    .data_file(old_entry.data_file().clone());
-
-                builder.build()
-            };
-
-            let manifest_list = snapshot
-                .load_manifest_list(
-                    snapshot_produce.table.file_io(),
-                    snapshot_produce.table.metadata(),
-                )
-                .await?;
-
-            let mut deleted_entries = Vec::new();
-
-            for manifest_file in manifest_list.entries() {
-                let manifest = manifest_file
-                    .load_manifest(snapshot_produce.table.file_io())
-                    .await?;
-
-                for entry in manifest.entries() {
-                    if entry.content_type() == DataContentType::Data
-                        && snapshot_produce
-                            .removed_data_file_paths
-                            .contains(entry.data_file().file_path())
-                    {
-                        deleted_entries.push(gen_manifest_entry(entry));
-                    }
-
-                    if (entry.content_type() == DataContentType::PositionDeletes
-                        || entry.content_type() == DataContentType::EqualityDeletes)
-                        && snapshot_produce
-                            .removed_delete_file_paths
-                            .contains(entry.data_file().file_path())
-                    {
-                        deleted_entries.push(gen_manifest_entry(entry));
-                    }
-                }
-            }
-
-            Ok(deleted_entries)
-        } else {
-            Ok(vec![])
-        }
+        // `existing_manifest` always runs first (see the call order in
+        // `SnapshotProducer::commit`) and populates this as a side effect of its
+        // one pass over the manifest list — draining it here instead of
+        // re-scanning every manifest a second time is what actually matters:
+        // manifest loads, not the size of the file lists being diffed, are what
+        // dominate commit latency (see the perf investigation this refactor
+        // came out of).
+        Ok(self
+            .deleted_entries
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default())
     }
 
     async fn existing_manifest(
@@ -155,10 +122,44 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             .load_manifest_list(file_io_ref, table_metadata_ref)
             .await?;
 
+        let gen_manifest_entry = |old_entry: &Arc<ManifestEntry>| {
+            ManifestEntry::builder()
+                .status(ManifestStatus::Deleted)
+                .snapshot_id(old_entry.snapshot_id().unwrap())
+                .sequence_number(old_entry.sequence_number().unwrap())
+                .file_sequence_number(old_entry.file_sequence_number().unwrap())
+                .data_file(old_entry.data_file().clone())
+                .build()
+        };
+
         let mut existing_files = Vec::new();
+        let mut deleted_entries = Vec::new();
 
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
+
+            // Same matching predicate `delete_entries` used to compute on its
+            // own, separate full scan of every manifest — collecting it here
+            // instead, in the one pass this method already makes over the same
+            // entries, halves the manifest loads for this commit.
+            for entry in manifest.entries() {
+                if entry.content_type() == DataContentType::Data
+                    && snapshot_produce
+                        .removed_data_file_paths
+                        .contains(entry.data_file().file_path())
+                {
+                    deleted_entries.push(gen_manifest_entry(entry));
+                }
+
+                if (entry.content_type() == DataContentType::PositionDeletes
+                    || entry.content_type() == DataContentType::EqualityDeletes)
+                    && snapshot_produce
+                        .removed_delete_file_paths
+                        .contains(entry.data_file().file_path())
+                {
+                    deleted_entries.push(gen_manifest_entry(entry));
+                }
+            }
 
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
@@ -205,6 +206,8 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                 }
             }
         }
+
+        *self.deleted_entries.lock().unwrap() = Some(deleted_entries);
 
         Ok(existing_files)
     }
@@ -488,7 +491,7 @@ mod tests {
         let table = make_v2_table_with_delete_manifest().await;
         let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
 
-        let producer = SnapshotProducer::new(
+        let mut producer = SnapshotProducer::new(
             &table,
             Uuid::now_v7(),
             None,
@@ -500,10 +503,14 @@ mod tests {
             vec![removed],
         );
 
-        let deleted_entries = ReplaceFilesOperation::<M>::new()
-            .delete_entries(&producer)
-            .await
-            .unwrap();
+        let operation = ReplaceFilesOperation::<M>::new();
+        // `delete_entries` now depends on `existing_manifest` having run first —
+        // it populates the deleted-entries cache as a side effect of its single
+        // pass over the manifest list. This matches the real call order in
+        // `SnapshotProducer::commit`.
+        operation.existing_manifest(&mut producer).await.unwrap();
+
+        let deleted_entries = operation.delete_entries(&producer).await.unwrap();
         let deleted_paths: Vec<&str> = deleted_entries
             .iter()
             .map(|entry| entry.data_file().file_path())
@@ -563,6 +570,41 @@ mod tests {
         assert_eq!(
             retained.file_sequence_number(),
             Some(PARENT_SEQUENCE_NUMBER)
+        );
+    }
+
+    /// `delete_entries` no longer scans manifests itself — it drains the cache
+    /// `existing_manifest` populates as a side effect of its own pass. Calling
+    /// it before `existing_manifest` has run must not panic or fabricate
+    /// deletes; it should just come back empty. Documents the ordering
+    /// dependency so a future reorder of the calls in `SnapshotProducer::commit`
+    /// fails a test instead of silently dropping deletes in production.
+    #[tokio::test]
+    async fn test_delete_entries_without_prior_existing_manifest_call_is_empty() {
+        let table = make_v2_table_with_delete_manifest().await;
+        let removed = position_delete_file(&table, REMOVED_DELETE_FILE);
+
+        let producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            None,
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![],
+            vec![removed],
+        );
+
+        let deleted_entries = ReplaceFilesOperation::<Rewrite>::new()
+            .delete_entries(&producer)
+            .await
+            .unwrap();
+
+        assert!(
+            deleted_entries.is_empty(),
+            "delete_entries without a prior existing_manifest call should be \
+             empty, not fabricate results: {deleted_entries:?}"
         );
     }
 
