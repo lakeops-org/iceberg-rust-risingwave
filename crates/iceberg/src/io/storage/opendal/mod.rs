@@ -349,14 +349,24 @@ impl OpenDalStorage {
     ///
     /// * An [`opendal::Operator`] instance used to operate on file.
     /// * Relative path to the root uri of [`opendal::Operator`].
+    // #[allow(unreachable_code, unused_variables)]
+    // pub(crate) fn create_operator<'a>(
+    //     &self,
+    //     path: &'a impl AsRef<str>,
+    // ) -> Result<(Operator, &'a str)> {
+    //     let config = HashMap::new();
+    //     self.create_operator_with_config(path, &config)
+    // }
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn create_operator<'a>(
         &self,
         path: &'a impl AsRef<str>,
     ) -> Result<(Operator, &'a str)> {
-        let config = HashMap::new();
+        let mut config = HashMap::new();
+        config.insert(IO_TIMEOUT_SECONDS.to_string(), "60".to_string());
         self.create_operator_with_config(path, &config)
     }
+
 
     /// Creates operator from path and applies runtime retry/timeout configuration.
     #[allow(unreachable_code, unused_variables)]

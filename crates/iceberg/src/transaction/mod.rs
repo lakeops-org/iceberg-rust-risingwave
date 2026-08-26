@@ -65,6 +65,8 @@ pub use manifest_filter::*;
 mod remove_snapshots;
 mod rewrite_manifests;
 mod snapshot;
+
+pub use snapshot::{CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY, CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE};
 mod sort_order;
 mod update_location;
 mod update_properties;

@@ -318,6 +318,12 @@ mod tests {
                     "name": "c13",
                     "required": true,
                     "type": "binary"
+                },
+                {
+                    "id": 14,
+                    "name": "c14",
+                    "required": true,
+                    "type": "timestamptz"
                 }
             ]
         }"#;
@@ -341,6 +347,7 @@ mod tests {
             create_column("c11", "string", "11", false)?,
             create_column("c12", "binary", "12", false)?,
             create_column("c13", "binary", "13", false)?,
+            create_column("c14", "timestamp", "14", false)?,
         ];
 
         assert_eq!(result, expected);
@@ -556,6 +563,32 @@ mod tests {
         let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
 
         let expected = vec![create_column("v", "variant", "1", false)?];
+
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_with_timestamptz_ns() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "ts",
+                    "required": true,
+                    "type": "timestamptz_ns"
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        let metadata = create_metadata_with_format_version(schema, FormatVersion::V3)?;
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let expected = vec![create_column("ts", "timestamp_ns", "1", false)?];
 
         assert_eq!(result, expected);
         Ok(())
