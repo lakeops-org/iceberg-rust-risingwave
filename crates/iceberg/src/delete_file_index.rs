@@ -125,7 +125,7 @@ enum DeleteFileIndexState {
 }
 
 #[derive(Debug)]
-struct PopulatedDeleteFileIndex {
+pub(crate) struct PopulatedDeleteFileIndex {
     global_equality_deletes: Vec<Arc<DeleteFileContext>>,
     eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>>,
@@ -206,7 +206,7 @@ impl PopulatedDeleteFileIndex {
     /// 2. If the partition is empty and the delete file is not a positional delete,
     ///    it is added to the `global_equality_deletes` vector
     /// 3. Otherwise, the delete file is added to one of two hash maps based on its content type.
-    fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
+    pub(crate) fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
         let mut eq_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
             HashMap::default();
         let mut pos_deletes_by_partition: HashMap<Struct, Vec<Arc<DeleteFileContext>>> =
@@ -250,7 +250,7 @@ impl PopulatedDeleteFileIndex {
     }
 
     /// Determine all the delete files that apply to the provided `DataFile`.
-    fn get_deletes_for_data_file(
+    pub(crate) fn get_deletes_for_data_file(
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,

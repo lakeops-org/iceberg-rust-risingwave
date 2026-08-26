@@ -16,18 +16,30 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
-use futures::stream::StreamExt;
+use futures::stream::{self, StreamExt};
 
 use super::maintenance::{DEFAULT_LOAD_CONCURRENCY, for_each_manifest, for_each_manifest_list};
+use crate::Result;
 use crate::spec::ManifestFile;
 use crate::table::Table;
-use crate::{Error, ErrorKind, Result};
 
 const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Default concurrency limit for file deletion.
+const DEFAULT_DELETE_CONCURRENCY: usize = 10;
+
+/// A file under the table location that is not referenced by any snapshot
+/// or table metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanFile {
+    /// Absolute path of the orphan file.
+    pub path: String,
+    /// Size of the file in bytes, as reported by the storage listing.
+    pub size_bytes: u64,
+}
 
 /// Deletes files below a table location that are not reachable from table metadata.
 ///
@@ -38,6 +50,7 @@ pub struct RemoveOrphanFilesAction {
     older_than_ms: i64,
     dry_run: bool,
     load_concurrency: usize,
+    delete_concurrency: usize,
 }
 
 impl RemoveOrphanFilesAction {
@@ -48,6 +61,7 @@ impl RemoveOrphanFilesAction {
             older_than_ms: now_ms().saturating_sub(DEFAULT_OLDER_THAN_MS),
             dry_run: false,
             load_concurrency: DEFAULT_LOAD_CONCURRENCY,
+            delete_concurrency: DEFAULT_DELETE_CONCURRENCY,
         }
     }
 
@@ -76,88 +90,60 @@ impl RemoveOrphanFilesAction {
         self
     }
 
-    /// Discovers orphan files, deletes them unless this is a dry run, and returns their paths.
-    pub async fn execute(self) -> Result<Vec<String>> {
+    /// Sets the concurrency limit for delete operations.
+    pub fn delete_concurrency(mut self, concurrency: usize) -> Self {
+        self.delete_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Discovers orphan files, deletes them unless this is a dry run, and
+    /// returns each orphan with its listed size.
+    pub async fn execute(self) -> Result<Vec<OrphanFile>> {
         let reachable = self.collect_reachable_files().await?;
         let listed = self
             .table
             .file_io()
             .list(self.table.metadata().location(), true)
             .await?;
+        let older_than_ms = self.older_than_ms;
+
+        let mut orphan_files: Vec<OrphanFile> = listed
+            .try_filter_map(|entry| {
+                let is_orphan = !entry.is_dir
+                    && !reachable.contains(&entry.path)
+                    && entry
+                        .last_modified_ms
+                        .is_some_and(|timestamp| timestamp < older_than_ms);
+                async move {
+                    Ok(is_orphan.then_some(OrphanFile {
+                        path: entry.path,
+                        size_bytes: entry.size,
+                    }))
+                }
+            })
+            .try_collect()
+            .await?;
+        orphan_files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
         if self.dry_run {
-            let mut orphans: Vec<String> = listed
-                .try_filter_map(|entry| {
-                    let is_orphan = !entry.is_dir
-                        && !reachable.contains(&entry.path)
-                        && entry
-                            .last_modified_ms
-                            .is_some_and(|timestamp| timestamp < self.older_than_ms);
-                    async move { Ok(is_orphan.then_some(entry.path)) }
-                })
-                .try_collect()
-                .await?;
-            orphans.sort_unstable();
-            return Ok(orphans);
+            return Ok(orphan_files);
         }
 
-        let discovered = Arc::new(Mutex::new(Vec::<String>::new()));
-        let listing_error = Arc::new(Mutex::new(None::<Error>));
-        let discovered_for_stream = discovered.clone();
-        let error_for_stream = listing_error.clone();
-        let older_than_ms = self.older_than_ms;
-        let delete_stream = listed.filter_map(move |entry| {
-            let path = match entry {
-                Ok(entry)
-                    if !entry.is_dir
-                        && !reachable.contains(&entry.path)
-                        && entry
-                            .last_modified_ms
-                            .is_some_and(|timestamp| timestamp < older_than_ms) =>
-                {
-                    if let Ok(mut paths) = discovered_for_stream.lock() {
-                        paths.push(entry.path.clone());
-                    }
-                    Some(entry.path)
-                }
-                Ok(_) => None,
-                Err(error) => {
-                    if let Ok(mut stored) = error_for_stream.lock()
-                        && stored.is_none()
-                    {
-                        *stored = Some(error);
-                    }
-                    None
-                }
-            };
-            async move { path }
-        });
-        self.table.file_io().delete_stream(delete_stream).await?;
+        // Clone paths into owned Strings so each async task owns its data,
+        // making the resulting future Send-safe (avoids HRTB lifetime issues
+        // with borrowed references across await points).
+        let paths: Vec<String> = orphan_files.iter().map(|file| file.path.clone()).collect();
+        let file_io = self.table.file_io().clone();
+        stream::iter(paths)
+            .map(|path| {
+                let file_io = file_io.clone();
+                async move { file_io.delete(&path).await }
+            })
+            .buffer_unordered(self.delete_concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        if let Some(error) = listing_error
-            .lock()
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to acquire listing error lock: {error}"),
-                )
-            })?
-            .take()
-        {
-            return Err(error);
-        }
-
-        let mut orphans = discovered
-            .lock()
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to acquire discovered paths lock: {error}"),
-                )
-            })?
-            .clone();
-        orphans.sort_unstable();
-        Ok(orphans)
+        Ok(orphan_files)
     }
 
     async fn collect_reachable_files(&self) -> Result<HashSet<String>> {
@@ -282,7 +268,10 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        assert_eq!(dry_run, vec![orphan_file]);
+        assert_eq!(dry_run, vec![OrphanFile {
+            path: orphan_file.to_string(),
+            size_bytes: 4,
+        }]);
         assert!(table.file_io().exists(orphan_file).await.unwrap());
 
         let deleted = RemoveOrphanFilesAction::new(table.clone())
@@ -290,7 +279,10 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        assert_eq!(deleted, vec![orphan_file]);
+        assert_eq!(deleted, vec![OrphanFile {
+            path: orphan_file.to_string(),
+            size_bytes: 4,
+        }]);
         assert!(!table.file_io().exists(orphan_file).await.unwrap());
         assert!(table.file_io().exists(metadata_file).await.unwrap());
         assert!(table.file_io().exists(outside_file).await.unwrap());

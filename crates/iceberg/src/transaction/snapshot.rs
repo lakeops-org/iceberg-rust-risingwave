@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 use uuid::Uuid;
 
+use crate::delete_file_index::PopulatedDeleteFileIndex;
 use crate::error::Result;
+use crate::scan::DeleteFileContext;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
@@ -32,6 +34,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, ManifestFilterManager, ManifestWriterContext};
+use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 pub(crate) type DataFileIdentity = (String, Option<i64>, Option<i64>);
@@ -52,6 +55,18 @@ pub(crate) fn format_data_file_identity(identity: &DataFileIdentity) -> String {
         _ => identity.0.clone(),
     }
 }
+
+/// [`Error::context`] key tagging errors raised by
+/// [`SnapshotProducer::validate_no_new_deletes_for_data_files`] (the
+/// apache/iceberg#2308 guard) — set on both the "found a new conflicting
+/// delete" and "broken ancestry" cases. Callers that want to treat this
+/// specific conflict differently from other `DataInvalid` errors (e.g. not
+/// retrying it, since retrying with the same input can't change the
+/// outcome) can check for this marker rather than depend on `message()`
+/// text, which is not a stable API contract.
+pub const CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY: &str = "iceberg-error-class";
+/// Value paired with [`CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY`].
+pub const CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE: &str = "concurrent-delete-conflict";
 
 /// A trait that defines how different table operations produce new snapshots.
 ///
@@ -297,6 +312,193 @@ impl<'a> SnapshotProducer<'a> {
                     paths.join(", ")
                 ),
             ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates that no new delete file has been added, since
+    /// `starting_snapshot_id`, for any data file this commit is removing.
+    ///
+    /// Ports Java's `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`
+    /// (wired via `RewriteFiles.validateFromSnapshot`, added by apache/iceberg
+    /// PR #2865 to fix apache/iceberg#2308). Without this, a rewrite/compaction
+    /// commit that plans against a stale read of a data file's deletes can
+    /// have its output committed *after* a concurrent writer (e.g. a CDC/
+    /// upsert connector) adds a new delete against that same file — and
+    /// because the file is being removed, dangling-delete cleanup would
+    /// otherwise drop that new delete with no notion of when it was added,
+    /// silently resurrecting the rows it deletes.
+    ///
+    /// `ignore_equality_deletes` should be `true` exactly when the caller also
+    /// stamps new data files with the starting snapshot's sequence number
+    /// (`set_new_data_file_sequence_number`) — that stamp keeps newer equality
+    /// deletes correctly applicable to the rewritten output, so new equality
+    /// deletes don't need to block the commit. Position deletes/deletion
+    /// vectors reference a file path that stops existing after the rewrite,
+    /// so they can never be safely ignored — checked unconditionally.
+    pub(crate) async fn validate_no_new_deletes_for_data_files(
+        &self,
+        starting_snapshot_id: i64,
+        ignore_equality_deletes: bool,
+    ) -> Result<()> {
+        if self.removed_data_files.is_empty() {
+            return Ok(());
+        }
+
+        if self.table.metadata().format_version() < FormatVersion::V2 {
+            return Ok(());
+        }
+
+        let metadata_ref = self.table.metadata_ref();
+
+        let Some(branch_snapshot) = metadata_ref.snapshot_for_ref(&self.target_branch) else {
+            return Ok(());
+        };
+        let branch_snapshot = branch_snapshot.clone();
+
+        if branch_snapshot.snapshot_id() == starting_snapshot_id {
+            return Ok(());
+        }
+
+        let starting_sequence_number = match metadata_ref.snapshot_by_id(starting_snapshot_id) {
+            Some(snapshot) => snapshot.sequence_number(),
+            None => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot validate against snapshot {starting_snapshot_id}: it is not present in the table metadata."
+                    ),
+                )
+                .with_context(
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY,
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE,
+                ));
+            }
+        };
+
+        let mut last_snapshot = None;
+        for snapshot in ancestors_between(
+            &metadata_ref,
+            branch_snapshot.snapshot_id(),
+            Some(starting_snapshot_id),
+        ) {
+            last_snapshot = Some(snapshot);
+        }
+        let history_intact = match &last_snapshot {
+            None => true,
+            Some(snapshot) => snapshot.parent_snapshot_id() == Some(starting_snapshot_id),
+        };
+        if !history_intact {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot determine history between starting snapshot {starting_snapshot_id} and branch tip {}: starting snapshot is no longer an ancestor of the branch (it may have expired)",
+                    branch_snapshot.snapshot_id()
+                ),
+            )
+            .with_context(
+                CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY,
+                CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE,
+            ));
+        }
+
+        let manifest_list = self
+            .table
+            .manifest_list_reader(&branch_snapshot)
+            .load()
+            .await?;
+        let mut candidate_manifests = Vec::new();
+        for manifest in manifest_list.entries() {
+            if manifest.content == ManifestContentType::Deletes
+                && manifest.sequence_number > starting_sequence_number
+            {
+                candidate_manifests.push(manifest.clone());
+            }
+        }
+
+        if candidate_manifests.is_empty() {
+            return Ok(());
+        }
+
+        let mut new_delete_contexts: Vec<DeleteFileContext> = Vec::new();
+
+        for manifest_file in &candidate_manifests {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let Some(seq) = entry.sequence_number() else {
+                    continue;
+                };
+                if seq <= starting_sequence_number {
+                    continue;
+                }
+                if entry.content_type() == DataContentType::Data {
+                    continue;
+                }
+
+                new_delete_contexts.push(DeleteFileContext {
+                    manifest_entry: entry.clone(),
+                    partition_spec_id: entry.data_file().partition_spec_id(),
+                });
+            }
+        }
+
+        let delete_index = if new_delete_contexts.is_empty() {
+            None
+        } else {
+            Some(PopulatedDeleteFileIndex::new(new_delete_contexts))
+        };
+
+        for removed in &self.removed_data_files {
+            let matches = delete_index.as_ref().map_or_else(Vec::new, |index| {
+                index.get_deletes_for_data_file(removed, Some(starting_sequence_number))
+            });
+
+            if matches.is_empty() {
+                continue;
+            }
+
+            if ignore_equality_deletes {
+                let Some(conflicting) = matches
+                    .iter()
+                    .find(|task| task.file_type == DataContentType::PositionDeletes)
+                else {
+                    continue;
+                };
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot commit: found new position delete file {} for data file {} that \
+                         this operation removes, added after snapshot {starting_snapshot_id}. \
+                         Retry against the current snapshot so the new deletes are applied.",
+                        conflicting.file_path,
+                        removed.file_path(),
+                    ),
+                )
+                .with_context(
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY,
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE,
+                ));
+            } else {
+                let conflicting = &matches[0];
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot commit: found new delete file {} for data file {} that this \
+                         operation removes, added after snapshot {starting_snapshot_id}. Retry \
+                         against the current snapshot so the new deletes are applied.",
+                        conflicting.file_path,
+                        removed.file_path(),
+                    ),
+                )
+                .with_context(
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_KEY,
+                    CONCURRENT_DELETE_CONFLICT_CONTEXT_VALUE,
+                ));
+            }
         }
 
         Ok(())
