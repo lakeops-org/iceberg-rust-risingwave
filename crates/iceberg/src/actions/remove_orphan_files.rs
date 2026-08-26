@@ -18,8 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::TryStreamExt;
-use futures::stream::{self, StreamExt};
+use futures::{TryStreamExt, stream};
 
 use super::maintenance::{DEFAULT_LOAD_CONCURRENCY, for_each_manifest, for_each_manifest_list};
 use crate::Result;
@@ -27,9 +26,6 @@ use crate::spec::ManifestFile;
 use crate::table::Table;
 
 const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-
-/// Default concurrency limit for file deletion.
-const DEFAULT_DELETE_CONCURRENCY: usize = 10;
 
 /// A file under the table location that is not referenced by any snapshot
 /// or table metadata.
@@ -50,7 +46,6 @@ pub struct RemoveOrphanFilesAction {
     older_than_ms: i64,
     dry_run: bool,
     load_concurrency: usize,
-    delete_concurrency: usize,
 }
 
 impl RemoveOrphanFilesAction {
@@ -61,7 +56,6 @@ impl RemoveOrphanFilesAction {
             older_than_ms: now_ms().saturating_sub(DEFAULT_OLDER_THAN_MS),
             dry_run: false,
             load_concurrency: DEFAULT_LOAD_CONCURRENCY,
-            delete_concurrency: DEFAULT_DELETE_CONCURRENCY,
         }
     }
 
@@ -87,12 +81,6 @@ impl RemoveOrphanFilesAction {
     /// Sets the maximum number of manifest lists or manifests loaded concurrently.
     pub fn load_concurrency(mut self, concurrency: usize) -> Self {
         self.load_concurrency = concurrency.max(1);
-        self
-    }
-
-    /// Sets the concurrency limit for delete operations.
-    pub fn delete_concurrency(mut self, concurrency: usize) -> Self {
-        self.delete_concurrency = concurrency.max(1);
         self
     }
 
@@ -129,18 +117,10 @@ impl RemoveOrphanFilesAction {
             return Ok(orphan_files);
         }
 
-        // Clone paths into owned Strings so each async task owns its data,
-        // making the resulting future Send-safe (avoids HRTB lifetime issues
-        // with borrowed references across await points).
         let paths: Vec<String> = orphan_files.iter().map(|file| file.path.clone()).collect();
-        let file_io = self.table.file_io().clone();
-        stream::iter(paths)
-            .map(|path| {
-                let file_io = file_io.clone();
-                async move { file_io.delete(&path).await }
-            })
-            .buffer_unordered(self.delete_concurrency)
-            .try_collect::<Vec<_>>()
+        self.table
+            .file_io()
+            .delete_stream(stream::iter(paths))
             .await?;
 
         Ok(orphan_files)
