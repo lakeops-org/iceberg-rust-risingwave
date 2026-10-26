@@ -175,7 +175,7 @@ impl RemoveOrphanFilesAction {
         .await?;
 
         for_each_manifest(
-            self.table.file_io(),
+            &self.table,
             manifests.into_values().collect(),
             self.load_concurrency,
             |_, manifest| {

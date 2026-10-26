@@ -249,6 +249,14 @@ impl Error {
         self
     }
 
+    /// Return structured error context.
+    ///
+    /// Context values are not necessarily safe to log. Consumers must redact
+    /// sensitive values before propagating them across an error boundary.
+    pub fn context(&self) -> &[(&'static str, String)] {
+        &self.context
+    }
+
     /// Set source for error.
     ///
     /// # Notes
@@ -330,16 +338,6 @@ impl Error {
     #[inline]
     pub fn message(&self) -> &str {
         self.message.as_str()
-    }
-
-    /// Return error's context entries, in the order they were added via
-    /// [`Error::with_context`].
-    ///
-    /// Lets callers key off a specific, stable marker (set via
-    /// `with_context`) to distinguish an error from others that share the
-    /// same [`ErrorKind`], without depending on `message()` text.
-    pub fn context(&self) -> &[(&'static str, String)] {
-        &self.context
     }
 }
 
