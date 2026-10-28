@@ -4417,4 +4417,97 @@ mod tests {
             .set_new_data_file_sequence_number(STARTING_SEQUENCE_NUMBER);
         assert!(Arc::new(action).commit(&table).await.is_ok());
     }
+
+    /// Returns `table` with `main` pointing back at the starting snapshot, i.e. the table as it
+    /// looked before the concurrent delete was committed.
+    fn table_at_starting_snapshot(table: &Table) -> Table {
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    STARTING_SNAPSHOT_ID,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        table.clone().with_metadata(Arc::new(metadata))
+    }
+
+    #[tokio::test]
+    async fn test_validate_from_snapshot_fails_on_retry_after_new_position_delete() {
+        let new_delete = position_delete_referencing(
+            &make_v2_minimal_table(),
+            "test/del.parquet",
+            TARGET_DATA_FILE,
+            false,
+        );
+        let concurrent_table = make_v2_table_with_concurrent_snapshot(Operation::Append, vec![(
+            new_delete,
+            CONCURRENT_SEQUENCE_NUMBER,
+        )])
+        .await;
+        let starting_table = table_at_starting_snapshot(&concurrent_table);
+        let removed = data_file(&concurrent_table, TARGET_DATA_FILE);
+
+        let action = Arc::new(
+            rewrite_action(removed)
+                .validate_from_snapshot(STARTING_SNAPSHOT_ID)
+                .set_new_data_file_sequence_number(STARTING_SEQUENCE_NUMBER),
+        );
+
+        // First attempt sees no concurrent delete and caches its prepared manifests.
+        assert!(Arc::clone(&action).commit(&starting_table).await.is_ok());
+        assert!(
+            action
+                .state
+                .lock()
+                .expect("rewrite-files state poisoned")
+                .prepared
+                .is_some()
+        );
+
+        // The retry rebases onto the tip that added the delete and must still reject it.
+        let err = expect_err(action.commit(&concurrent_table).await);
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("found new position delete"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_from_snapshot_fails_on_overwrite_with_new_position_delete() {
+        let new_delete = position_delete_referencing(
+            &make_v2_minimal_table(),
+            "test/del.parquet",
+            TARGET_DATA_FILE,
+            false,
+        );
+        let table = make_v2_table_with_concurrent_snapshot(Operation::Append, vec![(
+            new_delete,
+            CONCURRENT_SEQUENCE_NUMBER,
+        )])
+        .await;
+        let removed = data_file(&table, TARGET_DATA_FILE);
+
+        let action = super::OverwriteFilesAction::new()
+            .delete_files(vec![removed])
+            .set_target_branch(MAIN_BRANCH.to_string())
+            .validate_from_snapshot(STARTING_SNAPSHOT_ID);
+
+        let err = expect_err(Arc::new(action).commit(&table).await);
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("found new delete"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
 }
